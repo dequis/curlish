@@ -456,9 +456,9 @@ class Site(object):
         fail("Couldn't authorize: %s - %s" % (error, error_msg))
 
     def request_rfc5849_authorization_code_grant(self):
-        redirect_uri = u'http://127.0.0.1:%d/' % settings.values['http_port']
-        oauth = OAuth1(self.client_id, self.client_secret, callback_uri=redirect_uri,
+        oauth = OAuth1(self.client_id, self.client_secret, callback_uri='oob',
                        signature_type=self.signature_type)
+
         (request_token_url, headers, body) = oauth.sign(
             unicode(self.request_token_url),
             u'POST',
@@ -483,38 +483,32 @@ class Site(object):
         logger.debug("Confirm the user's authorization via: {0}".format(browser_url))
 
         webbrowser.open(browser_url)
-        server_address = ('127.0.0.1', settings.values['http_port'])
-        httpd = HTTPServer(server_address, AuthorizationHandler)
-        httpd.token_response = None
-        httpd.handle_request()
-        logger.debug('{0}'.format(httpd.token_response))
-        if 'oauth_verifier' in httpd.token_response:
-            return self.exchange_rfc5849_verifier_for_access_token(
-                { 'oauth_verifier': httpd.token_response['oauth_verifier'] },
-                rdata['oauth_token'],
-                rdata['oauth_token_secret'],
-                redirect_uri)
 
-        print 'Could not sign in: grant cancelled'
-        for key, value in httpd.token_response.iteritems():
-            print '  %s: %s' % (key, value)
+        oauth_verifier = raw_input('Enter PIN: ').strip()
+
+        if oauth_verifier:
+            return self.exchange_rfc5849_verifier_for_access_token(
+                { 'oauth_verifier': oauth_verifier },
+                rdata['oauth_token'],
+                rdata['oauth_token_secret'])
+
+        print 'No PIN entered: grant cancelled'
         sys.exit(1)
 
     def exchange_rfc5849_verifier_for_access_token(self, params, request_token,
-                                                   request_token_secret,
-                                                   redirect_uri):
+                                                   request_token_secret):
         settings.values['rfc5849_token_cache'][self.name] = self.get_rfc5849_access_token(
-            params, request_token, request_token_secret, redirect_uri)
+            params, request_token, request_token_secret)
 
     def get_rfc5849_access_token(self, params, request_token,
-                                 request_token_secret, redirect_uri):
+                                 request_token_secret):
         """Tries to load tokens with the given parameters."""
         data = params.copy()
 
         oauth = OAuth1(self.client_id, self.client_secret,
                        unicode(request_token),
                        unicode(request_token_secret),
-                       callback_uri=redirect_uri, signature_type=self.signature_type)
+                       callback_uri='oob', signature_type=self.signature_type)
         (access_token_url, headers, body) = oauth.sign(
             unicode(self.access_token_url),
             u'POST',

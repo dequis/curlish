@@ -996,6 +996,27 @@ def invoke_curl(site, curl_path, args, url_arg, dump_args=False,
         elif site.bearer_transmission == 'query':
             url += ('?' in url and '&' or '?') + 'access_token=' + \
                 urllib.quote(site.access_token)
+        elif site.bearer_transmission == 'rfc5849':
+            oauth = OAuth1(
+                site.client_id,
+                site.client_secret,
+                site.access_token,
+                site.access_token_secret,
+                signature_type='AUTH_HEADER')
+
+            method_arg = find_method_arg(args)
+            method = args[method_arg] if method_arg else 'GET'
+
+            (url, headers, _) = oauth.sign(
+                unicode(url),
+                unicode(method),
+                body=None,
+                headers=None,
+                realm=None)
+
+            for item in headers.iteritems():
+                args += ['-H', '%s: %s' % item]
+
         else:
             fail('Bearer transmission %s is unknown.' % site.bearer_transmission)
 
@@ -1107,25 +1128,6 @@ def main():
     if site is not None and site.grant_type is not None:
         site.fetch_token_if_necessarys()
     settings.save()
-    if site.oauth_version == 'rfc5849':
-        oauth = OAuth1(
-            site.client_id,
-            site.client_secret,
-            site.access_token,
-            site.access_token_secret,
-            signature_type='QUERY')
-        method_arg = find_method_arg(extra_args)
-        if method_arg is None:
-            method = 'GET'
-        else:
-            method = extra_args[method_arg]
-        (extra_args[url_arg], headers, body) = oauth.sign(
-            unicode(extra_args[url_arg]),
-            unicode(method),
-            body=None,
-            headers=None,
-            realm=None)
-        logger.debug('Signed request URL: {0}'.format(extra_args[url_arg]))
     invoke_curl(site, settings.values['curl_path'], extra_args, url_arg,
                 dump_args=args.dump_curl_args,
                 dump_response=args.dump_response)

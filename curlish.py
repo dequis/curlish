@@ -66,6 +66,14 @@ from httplib import HTTPConnection, HTTPSConnection
 from BaseHTTPServer import HTTPServer, BaseHTTPRequestHandler
 from getpass import getpass
 from uuid import UUID
+import logging
+
+try:
+    from oauthlib.oauth1.rfc5849 import Client as OAuth1
+except ImportError:
+    class OAuth1(object):
+        def __init__(*args, **kwargs):
+            raise NotImplementedError('RFC 5849 authorization requires oauthlib')
 
 
 # Not set when frozen
@@ -228,6 +236,12 @@ def find_url_arg(arguments):
         if arg.startswith(('http:', 'https:')):
             return idx
 
+def find_method_arg(arguments):
+    """Finds the HTTP method argument in acurl argument list."""
+    for idx, arg in enumerate(arguments):
+        if arg == '-X':
+            return idx + 1
+
 
 class AuthorizationHandler(BaseHTTPRequestHandler):
     """Callback handler for the code based authorization"""
@@ -238,7 +252,8 @@ class AuthorizationHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.server.token_response = dict((k, v[-1]) for k, v in
             cgi.parse_qs(self.path.split('?')[-1]).iteritems())
-        if 'code' in self.server.token_response:
+        if 'code' in self.server.token_response or \
+           'oauth_verifier' in self.server.token_response:
             title = 'Tokens Received'
             text = 'The tokens were transmitted successfully to curlish.'
         else:
@@ -308,7 +323,10 @@ class Site(object):
             return url
         self.name = name
         self.base_url = values.get('base_url')
+        self.oauth_version = values.get('oauth_version', '2.0')
         self.grant_type = values.get('grant_type', 'authorization_code')
+        self.signature_type = values.get('signature_type', 'AUTH_HEADER')
+        self.request_token_url = _full_url(values.get('request_token_url'))
         self.access_token_url = _full_url(values.get('access_token_url'))
         self.authorize_url = _full_url(values.get('authorize_url'))
         self.client_id = values.get('client_id')
@@ -318,6 +336,7 @@ class Site(object):
         self.bearer_transmission = values.get('bearer_transmission', 'query')
         self.default = values.get('default', False)
         self.access_token = None
+        self.access_token_secret = None
 
     def make_request(self, method, url, headers=None, data=None):
         """Makes an HTTP request to the site."""
@@ -337,17 +356,26 @@ class Site(object):
         real_headers = self.extra_headers.copy()
         real_headers.update(headers or ())
 
-        conn.request(method, u.path, data, real_headers)
+        uri = u.path + ('?' + u.query if u.query else '')
+        logger.debug('Request: {0} {1}'.format(method, url))
+        logger.debug('Request headers: {0}'.format(real_headers))
+        logger.debug('Request body: {0}'.format(data))
+        conn.request(method, uri, data, real_headers)
         resp = conn.getresponse()
+        resp_body = resp.read()
+        logger.debug('Response status: {0}'.format(resp.status))
+        logger.debug('Response headers: {0}'.format(resp.getheaders()))
+        logger.debug('Response body: {0}'.format(resp_body))
 
         ct = resp.getheader('Content-Type')
         if ct.startswith('application/json') or ct.startswith('text/javascript'):
-            resp_data = json.loads(resp.read())
-        elif ct.startswith('text/html'):
-            fail('Invalid response from server: ' + resp.read())
+            resp_data = json.loads(resp_body)
         else:
+            if not ct.startswith('application/x-www-form-urlencoded'):
+                logger.info('Unexpected Content-Type from server: ' + ct + '. Trying to continue anyway.')
+
             resp_data = dict((k, v[-1]) for k, v in
-                cgi.parse_qs(resp.read()).iteritems())
+                             cgi.parse_qs(resp_body).iteritems())
 
         return resp.status, resp_data
 
@@ -420,6 +448,95 @@ class Site(object):
             print '  %s: %s' % (key, value)
         sys.exit(1)
 
+    def get_rfc5849_request_token(self, params, headers):
+        """Tries to load tokens with the given parameters."""
+        data = params
+        status, data = self.make_request('POST',
+                                         self.request_token_url, data=data, headers=headers)
+
+        if status >= 200 and status < 300:
+            return data
+        error = data.get('error')
+        if error in ('invalid_grant', 'access_denied'):
+            return None
+        error_msg = data.get('error_description')
+        fail("Couldn't authorize: %s - %s" % (error, error_msg))
+
+    def request_rfc5849_authorization_code_grant(self):
+        oauth = OAuth1(self.client_id, self.client_secret, callback_uri='oob',
+                       signature_type=self.signature_type)
+
+        (request_token_url, headers, body) = oauth.sign(
+            unicode(self.request_token_url),
+            u'POST',
+            body='',
+            headers={'Content-Type': 'application/x-www-form-urlencoded',
+                     'Accept': 'application/x-www-form-urlencoded'},
+            realm=None)
+
+        rdata = self.get_rfc5849_request_token(body, headers)
+
+        logger.debug('Temporary credentials response: {0}'.format(rdata))
+        
+        params = {
+            'oauth_token': rdata['oauth_token'],
+        }
+        params.update(self.request_token_params)
+        browser_url = '%s?%s' % (
+            self.authorize_url,
+            urllib.urlencode(params)
+        )
+
+        logger.debug("Confirm the user's authorization via: {0}".format(browser_url))
+
+        webbrowser.open(browser_url)
+
+        oauth_verifier = raw_input('Enter PIN: ').strip()
+
+        if oauth_verifier:
+            return self.exchange_rfc5849_verifier_for_access_token(
+                { 'oauth_verifier': oauth_verifier },
+                rdata['oauth_token'],
+                rdata['oauth_token_secret'])
+
+        print 'No PIN entered: grant cancelled'
+        sys.exit(1)
+
+    def exchange_rfc5849_verifier_for_access_token(self, params, request_token,
+                                                   request_token_secret):
+        settings.values['rfc5849_token_cache'][self.name] = self.get_rfc5849_access_token(
+            params, request_token, request_token_secret)
+
+    def get_rfc5849_access_token(self, params, request_token,
+                                 request_token_secret):
+        """Tries to load tokens with the given parameters."""
+        data = params.copy()
+
+        oauth = OAuth1(self.client_id, self.client_secret,
+                       unicode(request_token),
+                       unicode(request_token_secret),
+                       callback_uri='oob', signature_type=self.signature_type)
+        (access_token_url, headers, body) = oauth.sign(
+            unicode(self.access_token_url),
+            u'POST',
+            body=data,
+            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            realm=None)
+
+        status, data = self.make_request('POST',
+                                         self.access_token_url, data=body, headers=headers)
+
+        if status >= 200 and status < 300:
+            return {
+                'access_token': unicode(data['oauth_token']),
+                'access_token_secret': unicode(data['oauth_token_secret']),
+            }
+        error = data.get('error')
+        if error in ('invalid_grant', 'access_denied'):
+            return None
+        error_msg = data.get('error_description')
+        fail("Couldn't authorize: %s - %s" % (error, error_msg))
+
     def exchange_code_for_token(self, code, redirect_uri):
         settings.values['token_cache'][self.name] = self.get_access_token({
             'code':         code,
@@ -434,15 +551,25 @@ class Site(object):
             self.request_authorization_code_grant()
         elif self.grant_type == 'client_credentials':
             self.request_client_credentials_grant()
+        elif self.grant_type == 'rfc5849_authorization_code':
+            self.request_rfc5849_authorization_code_grant()
         else:
             fail('Invalid grant configured: %s' % self.grant_type)
 
     def fetch_token_if_necessarys(self):
-        token_cache = settings.values['token_cache']
-        if token_cache.get(self.name) is None:
-            self.request_tokens()
-        self.access_token = token_cache[self.name]
-
+        if self.oauth_version == '2.0':
+            token_cache = settings.values['token_cache']
+            if token_cache.get(self.name) is None:
+                self.request_tokens()
+            self.access_token = token_cache[self.name]
+        elif self.oauth_version == 'rfc5849':
+            token_cache = settings.values['rfc5849_token_cache']
+            if token_cache.get(self.name) is None:
+                self.request_tokens()
+            self.access_token = token_cache[self.name]['access_token']
+            self.access_token_secret = token_cache[self.name]['access_token_secret']
+        else:
+            fail('Invalid OAuth version configured: %s' % self.oauth_version)
 
 def get_site_by_name(name):
     """Finds a site by its name."""
@@ -919,6 +1046,27 @@ def invoke_curl(site, curl_path, args, url_arg, dump_args=False,
         elif site.bearer_transmission == 'query':
             url += ('?' in url and '&' or '?') + 'access_token=' + \
                 urllib.quote(site.access_token)
+        elif site.bearer_transmission == 'rfc5849':
+            oauth = OAuth1(
+                site.client_id,
+                site.client_secret,
+                site.access_token,
+                site.access_token_secret,
+                signature_type='AUTH_HEADER')
+
+            method_arg = find_method_arg(args)
+            method = args[method_arg] if method_arg else 'GET'
+
+            (url, headers, _) = oauth.sign(
+                unicode(url),
+                unicode(method),
+                body=None,
+                headers=None,
+                realm=None)
+
+            for item in headers.iteritems():
+                args += ['-H', '%s: %s' % item]
+
         else:
             fail('Bearer transmission %s is unknown.' % site.bearer_transmission)
 
@@ -991,6 +1139,9 @@ def main():
     parser.add_argument('--clear-cookies', action='store_true',
                         help='Deletes all the cookies or cookies that belong '
                              'to one specific site only.')
+    parser.add_argument('--logging-level',
+                        help='Log output with the given logging level, '
+                             'e.g., DEBUG, INFO, etc.')
     parser.add_argument('--dump-curl-args', action='store_true',
                         help='Instead of executing dump the curl command line '
                              'arguments for this call')
@@ -1033,6 +1184,9 @@ def main():
         clear_cookies(args.site)
         return
 
+    if args.logging_level:
+        logging.basicConfig(level=args.logging_level)
+
     # Redirect everything else to curl via the site
     url_arg = find_url_arg(extra_args)
     if url_arg is None:
@@ -1047,6 +1201,7 @@ def main():
                 dump_response=args.dump_response,
                 json_stream=args.json_stream)
 
+logger = logging.getLogger(__name__)
 
 if __name__ == '__main__':
     try:
